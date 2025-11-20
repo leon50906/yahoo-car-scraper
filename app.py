@@ -1,5 +1,5 @@
 from flask import Flask, render_template_string, jsonify, request
-import requests
+import cloudscraper # [v18.0] 改用這個強力套件
 from bs4 import BeautifulSoup
 import time
 import random
@@ -8,11 +8,15 @@ from urllib.parse import urljoin
 
 app = Flask(__name__)
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Referer': 'https://autos.yahoo.com.tw/',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-}
+# [v18.0] 初始化強力爬蟲引擎
+# browser設定讓它看起來像真的 Chrome
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
 
 TARGET_YEARS = ["2024", "2025", "2026"]
 
@@ -53,7 +57,21 @@ def clean_text(text):
     if not text: return ""
     return re.sub(r'\s+', ' ', text.strip())
 
-# [v16.0] 引擎型式全域獵殺
+# [v18.0] 使用 scraper 發送請求的通用函式
+def fetch_url(url):
+    try:
+        # 使用 scraper.get 而不是 requests.get
+        resp = scraper.get(url, timeout=15)
+        if resp.status_code == 200:
+            return resp
+        else:
+            print(f"Error: {url} returned status {resp.status_code}")
+            return None
+    except Exception as e:
+        print(f"Exception fetching {url}: {e}")
+        return None
+
+# 引擎資訊解析
 def hunt_engine_info(soup, raw_specs):
     candidates = [raw_specs.get("engine_general", ""), raw_specs.get("induction", ""), raw_specs.get("cylinders", "")]
     for li in soup.find_all('li'):
@@ -62,7 +80,6 @@ def hunt_engine_info(soup, raw_specs):
             candidates.append(txt)
     full_text = " ".join(candidates)
     
-    # 進氣
     induction = ""
     if "渦輪" in full_text or "Turbo" in full_text: induction = "渦輪增壓"
     elif "機械增壓" in full_text: induction = "機械增壓"
@@ -70,7 +87,6 @@ def hunt_engine_info(soup, raw_specs):
     elif "自然進氣" in full_text or "NA" in full_text: induction = "自然進氣"
     if not induction and raw_specs.get("displacement_val", 0) > 0: induction = "自然進氣"
 
-    # 缸數
     cyl = ""
     match_std = re.search(r'(直列\d+缸|V型\d+缸|水平對臥\d+缸|W型\d+缸)', full_text)
     match_cn = re.search(r'(直列[二三四五六八十]+缸|V型[六八十]+缸)', full_text)
@@ -88,41 +104,28 @@ def hunt_engine_info(soup, raw_specs):
     parts = [p for p in [induction, cyl] if p]
     return "/".join(parts) if parts else "N/A"
 
-# [v17.0] 修正版 EV 續航搜尋 (排除 G63 誤判)
+# EV 續航搜尋
 def hunt_ev_range(soup):
     keywords = ["續航", "滿電", "最大里程", "WLTP", "NEDC"]
-    # 嚴格排除詞
     exclude_keywords = ["油耗", "公升", "L/100km", "加速", "0-100", "秒"]
 
     def check_text(txt):
-        # 1. 必須包含關鍵字
         if not any(k in txt for k in keywords): return None
-        # 2. 絕對不能包含排除詞 (避免 G63 0-100km/h 被抓到)
         if any(bad in txt for bad in exclude_keywords): return None
-        # 3. 必須包含單位
         if "km" not in txt.lower() and "公里" not in txt: return None
-        
-        # 4. Regex 提取，並使用 Negative Lookahead 排除 km/h
-        # (?![/h]) 意思是 km 後面不能接 / 或 h
         match = re.search(r'(\d+(\.\d+)?)\s*(?:km|公里)(?!\s*[/hhr小時])', txt, re.IGNORECASE)
-        if match:
-            return match.group(1)
+        if match: return match.group(1)
         return None
 
-    # 1. 搜 li
     for li in soup.find_all('li'):
-        txt = clean_text(li.get_text())
-        res = check_text(txt)
+        res = check_text(clean_text(li.get_text()))
         if res: return res
 
-    # 2. 搜 span, div
     elements = soup.find_all(string=re.compile(r'(km|公里)'))
     for el in elements:
         parent = el.parent
-        line = clean_text(parent.get_text())
-        res = check_text(line)
+        res = check_text(clean_text(parent.get_text()))
         if res: return res
-        
     return None
 
 # -------------------------------------------------
@@ -131,23 +134,27 @@ def hunt_ev_range(soup):
 @app.route('/api/brands')
 def get_brands():
     url = "https://autos.yahoo.com.tw/new-cars/make"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=5)
-        if resp.status_code != 200: return jsonify(sorted(FALLBACK_BRANDS, key=lambda x: x['name']))
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        brands = []
-        seen = set()
-        for link in soup.find_all('a', href=re.compile(r'/new-cars/make/[\w-]+$')):
-            href = link['href']
-            if not href.startswith('http'): href = urljoin("https://autos.yahoo.com.tw", href)
-            name = link.text.strip() or (link.find('img').get('alt') if link.find('img') else "")
-            if name and href not in seen and "中古" not in name and "CMC" not in name:
-                brands.append({"name": name, "url": href})
-                seen.add(href)
-        if not brands: return jsonify(sorted(FALLBACK_BRANDS, key=lambda x: x['name']))
-        brands.sort(key=lambda x: x['name'].lower())
-        return jsonify(brands)
-    except: return jsonify(sorted(FALLBACK_BRANDS, key=lambda x: x['name']))
+    resp = fetch_url(url)
+    
+    # 如果 Render 抓不到，直接回傳備用清單 (這在雲端上很常見)
+    if not resp: 
+        print("Brand fetch failed, using fallback.")
+        return jsonify(sorted(FALLBACK_BRANDS, key=lambda x: x['name']))
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    brands = []
+    seen = set()
+    for link in soup.find_all('a', href=re.compile(r'/new-cars/make/[\w-]+$')):
+        href = link['href']
+        if not href.startswith('http'): href = urljoin("https://autos.yahoo.com.tw", href)
+        name = link.text.strip() or (link.find('img').get('alt') if link.find('img') else "")
+        if name and href not in seen and "中古" not in name and "CMC" not in name:
+            brands.append({"name": name, "url": href})
+            seen.add(href)
+            
+    if not brands: return jsonify(sorted(FALLBACK_BRANDS, key=lambda x: x['name']))
+    brands.sort(key=lambda x: x['name'].lower())
+    return jsonify(brands)
 
 @app.route('/api/get_brand_urls')
 def get_brand_urls():
@@ -157,35 +164,45 @@ def get_brand_urls():
         brand_slug = brand_url.rstrip('/').split('/')[-1].lower()
         if brand_slug == 'mercedes-benz': brand_slug = 'm-benz'
     except: brand_slug = ""
-    print(f"分析品牌: {brand_slug}")
+    
+    print(f"Analyzing brand: {brand_slug}")
     urls_to_scrape = []
-    try:
-        resp = requests.get(brand_url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        target_models = set()
-        for link in soup.find_all('a', href=re.compile(r'/new-cars/model/')):
-            href = link['href']
-            m_name = link.text.strip() or (link.find(class_='title').text.strip() if link.find(class_='title') else "")
-            if brand_slug and brand_slug not in href.lower(): continue 
-            if any(year in m_name for year in TARGET_YEARS):
-                 target_models.add(urljoin("https://autos.yahoo.com.tw", href))
-        for m_url in target_models:
-            try:
-                time.sleep(random.uniform(0.05, 0.15))
-                m_resp = requests.get(m_url, headers=HEADERS)
-                m_soup = BeautifulSoup(m_resp.text, 'html.parser')
-                for t_link in m_soup.find_all('a', href=re.compile(r'/new-cars/trim/')):
-                    t_href = t_link['href']
-                    if brand_slug and brand_slug not in t_href.lower(): continue
-                    t_url = urljoin("https://autos.yahoo.com.tw", t_href)
-                    if t_url not in urls_to_scrape: urls_to_scrape.append(t_url)
-            except: pass
-        return jsonify(urls_to_scrape)
-    except: return jsonify([])
+    
+    resp = fetch_url(brand_url)
+    if not resp: return jsonify([])
 
-# -------------------------------------------------
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    target_models = set()
+    
+    for link in soup.find_all('a', href=re.compile(r'/new-cars/model/')):
+        href = link['href']
+        m_name = link.text.strip() or (link.find(class_='title').text.strip() if link.find(class_='title') else "")
+        if brand_slug and brand_slug not in href.lower(): continue 
+        if any(year in m_name for year in TARGET_YEARS):
+             target_models.add(urljoin("https://autos.yahoo.com.tw", href))
+    
+    print(f"Found {len(target_models)} models, scraping trims...")
+
+    for m_url in target_models:
+        try:
+            time.sleep(random.uniform(0.1, 0.3)) # 在雲端上稍微慢一點比較安全
+            m_resp = fetch_url(m_url)
+            if not m_resp: continue
+            
+            m_soup = BeautifulSoup(m_resp.text, 'html.parser')
+            for t_link in m_soup.find_all('a', href=re.compile(r'/new-cars/trim/')):
+                t_href = t_link['href']
+                if brand_slug and brand_slug not in t_href.lower(): continue
+                t_url = urljoin("https://autos.yahoo.com.tw", t_href)
+                if t_url not in urls_to_scrape: urls_to_scrape.append(t_url)
+        except Exception as e: 
+            print(f"Error parsing model {m_url}: {e}")
+            pass
+            
+    print(f"Total trims found: {len(urls_to_scrape)}")
+    return jsonify(urls_to_scrape)
+
 # 規格抓取
-# -------------------------------------------------
 def extract_price_data(soup):
     price_text, price_val = "N/A", 0
     try:
@@ -233,8 +250,10 @@ def scrape_one():
     url = request.args.get('url')
     if not url: return jsonify({"error": "no url"})
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
+        resp = fetch_url(url)
+        if not resp: return jsonify({"error": "Failed to fetch page"})
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
         
         title_tag = soup.find('h1')
         full_title = clean_text(title_tag.text) if title_tag else "未知"
@@ -271,7 +290,6 @@ def scrape_one():
                 if h_t != "N/A": specs["power"] = h_t; specs["power_val"] = h_v
                 if t_t != "N/A": specs["torque"] = t_t; specs["torque_val"] = t_v
 
-        # [v17.0] 嚴格版 EV 續航搜尋
         ev_range = hunt_ev_range(soup)
         if ev_range:
             specs["fuel"] = f"{ev_range} km"; specs["fuel_val"] = float(ev_range); specs["is_ev"] = True
@@ -292,7 +310,7 @@ def scrape_one():
     except Exception as e: return jsonify({"error": str(e)})
 
 # -------------------------------------------------
-# 前端 HTML (含 Excel 下載)
+# 前端 HTML
 # -------------------------------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -300,7 +318,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Yahoo 汽車爬蟲 v17.0</title>
+    <title>Yahoo 汽車爬蟲 v18.0</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.datatables.net/1.11.5/css/dataTables.bootstrap5.min.css" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -320,7 +338,7 @@ HTML_TEMPLATE = """
 
 <div class="container-fluid">
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="fw-bold mb-0">🏎️ Yahoo 汽車超級比較器 <span class="badge bg-dark">v17.0 旗艦生產力版</span></h2>
+        <h2 class="fw-bold mb-0">🏎️ Yahoo 汽車比較器 <span class="badge bg-danger">v18.0 雲端防擋版</span></h2>
         <button id="btnExport" class="btn btn-outline-success" disabled>📥 下載 Excel</button>
     </div>
 
@@ -458,7 +476,7 @@ HTML_TEMPLATE = """
 
             totalItems = queue.length;
             if(totalItems === 0) {
-                $('#statusMsg').text('無符合車款。');
+                $('#statusMsg').text('無符合車款 (Yahoo 可能封鎖了雲端 IP)。');
                 $('#btnStart').prop('disabled', false);
                 return;
             }
@@ -467,12 +485,9 @@ HTML_TEMPLATE = """
             processQueue(); processQueue(); processQueue();
         });
 
-        // Excel 下載功能
         $('#btnExport').click(function() {
             let data = table.rows().data().toArray();
             if(data.length === 0) return;
-
-            // 轉換格式為中文標題
             let exportData = data.map(row => ({
                 "年份": row.year,
                 "品牌": row.brand,
@@ -487,12 +502,9 @@ HTML_TEMPLATE = """
                 "變速箱": row.transmission,
                 "連結": row.url
             }));
-
             let wb = XLSX.utils.book_new();
             let ws = XLSX.utils.json_to_sheet(exportData);
             XLSX.utils.book_append_sheet(wb, ws, "車款資料");
-            
-            // 產生檔名: Brands_Timestamp.xlsx
             let fileName = `Car_Specs_${new Date().toISOString().slice(0,10)}.xlsx`;
             XLSX.writeFile(wb, fileName);
         });
@@ -503,7 +515,7 @@ HTML_TEMPLATE = """
             if(processedItems >= totalItems && totalItems > 0) {
                 $('#statusMsg').html('<span class="text-success"><strong>✨ 完成！</strong></span>');
                 $('#btnStart').prop('disabled', false);
-                $('#btnExport').prop('disabled', false); // 啟用下載
+                $('#btnExport').prop('disabled', false);
             }
             return;
         }
@@ -512,7 +524,7 @@ HTML_TEMPLATE = """
             if(!data.error) table.row.add(data).draw(false);
             processedItems++;
             updateProgress();
-            setTimeout(processQueue, Math.random() * 300 + 200); 
+            setTimeout(processQueue, Math.random() * 1000 + 500); // 增加延遲至 1.5 秒
         }).fail(function() {
             processedItems++; updateProgress(); processQueue();
         });
@@ -533,5 +545,5 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 if __name__ == '__main__':
-    print("v17.0 旗艦版啟動: http://127.0.0.1:5000")
+    # 注意：Render 會使用 gunicorn 啟動，這裡的 main 主要是給本機開發用
     app.run(debug=True, port=5000)
