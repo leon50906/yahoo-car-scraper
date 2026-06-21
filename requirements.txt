@@ -1,5 +1,6 @@
 flask
 requests
 beautifulsoup4
-gunicorn
+xlsxwriter
+Flask-HTTPAuth
 cloudscraper
