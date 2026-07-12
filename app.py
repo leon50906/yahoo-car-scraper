@@ -10,8 +10,10 @@ from urllib.parse import urljoin
 from datetime import datetime
 import traceback
 
-# [v28.0] 引入終極破甲套件
-import cloudscraper 
+import cloudscraper
+# [v29.0] 引入重試機制模組
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 auth = HTTPBasicAuth()
@@ -25,7 +27,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Yahoo 汽車爬蟲 v28.0</title>
+    <title>Yahoo 汽車爬蟲 v29.0</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.datatables.net/1.11.5/css/dataTables.bootstrap5.min.css" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -44,7 +46,7 @@ HTML_TEMPLATE = """
 <body>
 <div class="container-fluid">
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="fw-bold mb-0">🏎️ Yahoo 汽車超級比較器 <span class="badge bg-dark">v28.0 突破封鎖版</span></h2>
+        <h2 class="fw-bold mb-0">🏎️ Yahoo 汽車超級比較器 <span class="badge bg-dark">v29.0 智慧防禦版</span></h2>
         <button id="btnExport" class="btn btn-outline-success" disabled>📥 下載 Excel</button>
     </div>
     
@@ -171,7 +173,7 @@ HTML_TEMPLATE = """
             $('.progress').show();
             $('#btnStart').prop('disabled', true);
             $('#btnExport').prop('disabled', true);
-            $('#statusMsg').html('<span class="text-danger">正在掃描...</span>');
+            $('#statusMsg').html('<span class="text-danger">正在收集品牌網址... (大型品牌需時較久)</span>');
             
             for(let i=0; i<selectedBrands.length; i++) {
                 try {
@@ -189,9 +191,13 @@ HTML_TEMPLATE = """
                 $('#btnStart').prop('disabled', false);
                 return;
             }
-            $('#statusMsg').html(`<span class="text-primary">抓取 ${totalItems} 台車規格中...</span>`);
-            processQueue(); processQueue(); processQueue();
+            $('#statusMsg').html(`<span class="text-primary">抓取 ${totalItems} 台車規格中... (已啟用防阻擋降速)</span>`);
+            
+            // [v29.0] 減輕伺服器壓力，將 3 個工人降為 2 個，並錯開 0.5 秒啟動
+            processQueue(); 
+            setTimeout(processQueue, 500); 
         });
+        
         $('#btnExport').click(function() {
             let data = table.rows().data().toArray();
             if(data.length === 0) return;
@@ -230,7 +236,8 @@ HTML_TEMPLATE = """
             if(!data.error) table.row.add(data).draw(false);
             processedItems++;
             updateProgress();
-            setTimeout(processQueue, Math.random() * 1000 + 500);
+            // [v29.0] 加入 1 ~ 2.5 秒的擬真隨機等待，避免觸發防護機制
+            setTimeout(processQueue, Math.random() * 1500 + 1000);
         }).fail(function() {
             processedItems++; updateProgress(); processQueue();
         });
@@ -248,7 +255,8 @@ HTML_TEMPLATE = """
 # 🔐 [設定區] 帳號密碼
 # ==========================================
 USERS = {
-    "root": generate_password_hash("leon50906")
+    "admin": generate_password_hash("123456"),
+    "leon": generate_password_hash("password")
 }
 
 @auth.verify_password
@@ -258,16 +266,27 @@ def verify_password(username, password):
     return None
 
 # ==========================================
-# 爬蟲設定與連線池建立
+# 爬蟲設定 (加入智慧重試與防封鎖機制)
 # ==========================================
-# [v28.0] 使用 cloudscraper 取代傳統 requests，完美模擬現代瀏覽器行為
 scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'desktop': True
-    }
+    browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
 )
+
+# [v29.0] 設定 HTTP 重試機制 (應對 HTTP 429 Too Many Requests)
+retry_strategy = Retry(
+    total=5,  # 最多重試 5 次
+    backoff_factor=1.5,  # 每次失敗後等待時間會拉長 (1.5s, 3s, 6s...)
+    status_forcelist=[429, 500, 502, 503, 504], # 遇到這些錯誤碼自動重試
+    allowed_methods=["HEAD", "GET", "OPTIONS"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+scraper.mount("https://", adapter)
+scraper.mount("http://", adapter)
+
+HEADERS = {
+    'Referer': 'https://autos.yahoo.com.tw/',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+}
 
 def get_dynamic_years():
     current_year = datetime.now().year
@@ -401,13 +420,7 @@ def get_brand_urls():
     urls_to_scrape = []
     
     try:
-        # [v28.0] 使用 scraper 取代 requests，突破防護
-        resp = scraper.get(brand_url, timeout=15)
-        
-        # 加上日誌，如果仍然被擋，我們可以看到原因
-        if resp.status_code != 200:
-            print(f"⚠️ 警告: Yahoo 首頁抓取失敗，狀態碼: {resp.status_code}")
-            
+        resp = scraper.get(brand_url, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(resp.text, 'html.parser')
         base_models = set()
         
@@ -428,16 +441,16 @@ def get_brand_urls():
                 guess_url = f"{base_url}-{year}"
                 if guess_url not in final_model_urls:
                     try:
-                        # [v28.0] 使用 scraper 進行暴力測試
-                        check = scraper.get(guess_url, timeout=5)
+                        time.sleep(random.uniform(0.1, 0.3)) # [v29.0] 避免比對時觸發防護
+                        check = scraper.get(guess_url, headers=HEADERS, timeout=10)
                         if check.status_code == 200:
                             final_model_urls.add(guess_url)
                     except: pass
 
         for m_url in final_model_urls:
             try:
-                time.sleep(random.uniform(0.1, 0.3)) # 稍微放慢一點避免被抓
-                m_resp = scraper.get(m_url, timeout=15)
+                time.sleep(random.uniform(0.2, 0.5)) # [v29.0] 放慢抓取速度
+                m_resp = scraper.get(m_url, headers=HEADERS, timeout=15)
                 m_soup = BeautifulSoup(m_resp.text, 'html.parser')
                 for t_link in m_soup.find_all('a', href=re.compile(r'/new-cars/trim/')):
                     t_href = t_link['href']
@@ -523,8 +536,7 @@ def scrape_one():
     url = request.args.get('url')
     if not url: return jsonify({"error": "no url"})
     try:
-        # [v28.0] 單車抓取也改用 scraper
-        response = scraper.get(url, timeout=15)
+        response = scraper.get(url, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(response.text, 'html.parser')
         title_tag = soup.find('h1')
         full_title = clean_text(title_tag.text) if title_tag else "未知"
@@ -566,7 +578,7 @@ def index():
 
 if __name__ == '__main__':
     print("=================================================")
-    print("🚗 Yahoo 汽車超級比較器 - NAS Secure 版 v28.0 (突破封鎖)")
+    print("🚗 Yahoo 汽車超級比較器 - NAS Secure 版 v29.0 (智慧防禦)")
     print("服務啟動中...")
     print("=================================================")
     try:
