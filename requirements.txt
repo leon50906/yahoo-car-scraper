@@ -1,6 +1,6 @@
-flask
-requests
-beautifulsoup4
-xlsxwriter
-Flask-HTTPAuth
-cloudscraper
+Flask>=3.0,<4
+beautifulsoup4>=4.12,<5
+Flask-HTTPAuth>=4.8,<5
+cloudscraper==1.2.71
+requests>=2.31,<3
+waitress>=3.0,<4

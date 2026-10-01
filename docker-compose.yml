@@ -1,0 +1,14 @@
+services:
+  car-scraper:
+    build: .
+    container_name: yahoo-car-scraper
+    restart: always
+    ports:
+      - "5520:5000"
+    # 登入帳密放在同資料夾的 .env（不進 git，範本見 .env.example）
+    env_file:
+      - .env
+    volumes:
+      - ./app.py:/app/app.py
+      # 快取快照存在這裡（重建容器也不會消失）
+      - ./data:/app/data
